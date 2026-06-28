@@ -1,7 +1,7 @@
 """
 setup_hindsight.py
 Run once to load all campaign data into the Hindsight memory bank.
-hsk_508e408ad972eb1a8018850b01bd9454_ccd180e5622164b3
+
 Prerequisites:
     pip install hindsight-client
     hindsight-api must be running (or use Hindsight Cloud URL)
@@ -24,7 +24,7 @@ from hindsight_client import Hindsight
 
 client = Hindsight(
     base_url="https://api.hindsight.vectorize.io",
-    api_key="hsk_508e408ad972eb1a8018850b01bd9454_ccd180e5622164b3" )
+    api_key="hsk_api" )
 
 with open(CAMPAIGNS_FILE, "r") as f:
     campaigns = json.load(f)
