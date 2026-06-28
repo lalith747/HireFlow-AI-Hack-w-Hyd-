@@ -5,6 +5,9 @@ CascadeFlowEngine — the core campaign decision engine.
 
 Refactored to run inside a CascadeflowSession so that every LLM call
 is tracked, measured, and (in enforce mode) governed by the CascadeFlow harness.
+
+Note: CascadeFlow auto-instruments OpenAI and Anthropic SDKs only.
+Groq calls are tracked manually via session.record_model_call().
 """
 
 import os
@@ -24,11 +27,12 @@ logger = logging.getLogger("decision_engine")
 # Model registry for multi-model routing
 # ---------------------------------------------------------------------------
 
-# These models must be available in your Groq account.
-# CascadeFlow will switch between them based on complexity in enforce mode.
-
 MODEL_SIMPLE = os.getenv("GROQ_MODEL_SIMPLE", "llama-3.1-8b-instant")
 MODEL_COMPLEX = os.getenv("GROQ_MODEL_COMPLEX", "llama-3.3-70b-versatile")
+
+# Approximate costs per 1K tokens (adjust based on Groq pricing)
+COST_PER_1K_SIMPLE = 0.00004   # llama-3.1-8b-instant ~ $0.04/M tokens
+COST_PER_1K_COMPLEX = 0.00059  # llama-3.3-70b ~ $0.59/M tokens
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -78,19 +82,18 @@ class CascadeFlowEngine:
         # Groq client — key loaded from environment only
         self.groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-        # Default budget per session (can be overridden per request)
+        # Default budget per session
         self.default_budget = float(os.getenv("CASCADEFLOW_DEFAULT_BUDGET", "1.00"))
 
-        # Routing mode
+        # Semantic routing toggle (our own logic, not CascadeFlow's)
         self.semantic_routing = (
             os.getenv("CASCADEFLOW_ENABLE_SEMANTIC_ROUTING", "true").lower() == "true"
         )
 
-        # Ensure harness is initialized (idempotent if already called in main.py)
+        # Ensure harness is initialized (idempotent)
         init_cascadeflow(
             mode=os.getenv("CASCADEFLOW_MODE", "observe"),
             budget=self.default_budget,
-            enable_semantic_routing=self.semantic_routing,
         )
 
     # ------------------------------------------------------------------
@@ -107,26 +110,6 @@ class CascadeFlowEngine:
     ) -> dict[str, Any]:
         """
         Execute the campaign decision pipeline inside a CascadeFlow session.
-
-        Parameters
-        ----------
-        user_input : str
-            The user's campaign brief / requirements.
-        total_budget : float
-            Total campaign budget in USD.
-        campaign_name : str
-            Human-readable name for tracing.
-        budget_cap : float or None
-            Maximum cumulative LLM spend for this execution.
-        labels : dict or None
-            Metadata attached to the session trace.
-
-        Returns
-        -------
-        dict with keys:
-            campaign_name, run_id, timestamp, total_budget,
-            complexity_score, model_used, platforms_selected,
-            budget_saved, cascadeflow_session_summary, metadata
         """
         run_id = str(uuid.uuid4())[:8]
         start_time = time.time()
@@ -139,9 +122,18 @@ class CascadeFlowEngine:
         labels.update({"run_id": run_id, "campaign": campaign_name})
 
         # ── Enter the CascadeFlow session ──────────────────────────
-        async with CascadeflowSession(budget=budget_cap, labels=labels) as session:
+        with CascadeflowSession(
+            budget=budget_cap,
+            labels=labels,
+        ) as session:
+
             # Phase 1: Complexity detection
             complexity_score = await self._detect_complexity(user_input)
+            # Record the complexity check call
+            session.record_model_call(
+                model=MODEL_SIMPLE,
+                cost=self._estimate_cost(MODEL_SIMPLE, prompt_tokens=50, completion_tokens=3),
+            )
 
             # Phase 2: Select model based on complexity (multi-model routing)
             selected_model = self._select_model(complexity_score)
@@ -152,14 +144,17 @@ class CascadeFlowEngine:
                 total_budget=total_budget,
                 model=selected_model,
             )
+            # Record the platform analysis call
+            session.record_model_call(
+                model=selected_model,
+                cost=self._estimate_cost(selected_model, prompt_tokens=200, completion_tokens=300),
+            )
 
-            # Phase 4: Budget redistribution from analysis
+            # Phase 4: Parse and compute
             platforms = self._parse_platforms(analysis, total_budget)
-
-            # Phase 5: Compute savings
             budget_saved = self._compute_savings(platforms, total_budget)
 
-            # Collect session summary from CascadeFlow
+            # Collect session summary
             session_summary = session.summary()
 
             # Build response
@@ -179,6 +174,7 @@ class CascadeFlowEngine:
                     "elapsed_ms": elapsed_ms,
                     "semantic_routing_enabled": self.semantic_routing,
                     "cascadeflow_mode": os.getenv("CASCADEFLOW_MODE", "observe"),
+                    "total_cost_estimate": round(session._manual_cost, 6),
                 },
             }
 
@@ -190,12 +186,7 @@ class CascadeFlowEngine:
     # ------------------------------------------------------------------
 
     async def _detect_complexity(self, user_input: str) -> int:
-        """
-        Call the LLM to rate input complexity on a 1-10 scale.
-
-        Uses the simple/fast model regardless of routing mode
-        to keep the complexity check cheap.
-        """
+        """Rate input complexity on a 1-10 scale using the cheap model."""
         prompt = COMPLEXITY_CHECK_PROMPT.format(user_input=user_input)
 
         try:
@@ -222,8 +213,6 @@ class CascadeFlowEngine:
 
         Simple (1-5)  → MODEL_SIMPLE  (llama-3.1-8b-instant)
         Complex (6-10) → MODEL_COMPLEX (llama-3.3-70b-versatile)
-
-        This is the routing decision that proves multi-model behavior.
         """
         if self.semantic_routing and complexity_score >= 6:
             selected = MODEL_COMPLEX
@@ -234,6 +223,13 @@ class CascadeFlowEngine:
             "[MODEL_SELECTION] complexity=%d → model=%s",
             complexity_score,
             selected,
+        )
+        print(
+            f"\n[MODEL_SELECTION]\n"
+            f"  Input Complexity: {'HIGH' if complexity_score >= 6 else 'LOW'} (score={complexity_score})\n"
+            f"  Selected Model: {selected}\n"
+            f"  Reason: {'Escalated After Quality Check' if complexity_score >= 6 else 'Cost Optimization'}\n"
+            f"  Estimated Cost: ${self._estimate_cost(selected, 200, 300):.4f}"
         )
         return selected
 
@@ -247,9 +243,7 @@ class CascadeFlowEngine:
         total_budget: float,
         model: str,
     ) -> str:
-        """
-        Call the selected Groq model to produce platform recommendations.
-        """
+        """Call the selected Groq model to produce platform recommendations."""
         prompt = PLATFORM_ANALYSIS_PROMPT.format(
             user_input=user_input,
             total_budget=total_budget,
@@ -265,18 +259,30 @@ class CascadeFlowEngine:
         return response.choices[0].message.content
 
     # ------------------------------------------------------------------
+    # Private: Cost estimation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """Estimate cost based on model and token counts."""
+        if model == MODEL_COMPLEX:
+            rate = COST_PER_1K_COMPLEX
+        else:
+            rate = COST_PER_1K_SIMPLE
+
+        total_tokens = prompt_tokens + completion_tokens
+        return (total_tokens / 1000) * rate
+
+    # ------------------------------------------------------------------
     # Private: Parsing and computation
     # ------------------------------------------------------------------
 
     @staticmethod
     def _parse_platforms(raw: str, total_budget: float) -> list[dict[str, Any]]:
-        """
-        Parse JSON from the LLM response and attach dollar amounts.
-        """
+        """Parse JSON from the LLM response and attach dollar amounts."""
         import json
 
         try:
-            # Strip markdown fences if present
             clean = raw.strip()
             if clean.startswith("```"):
                 lines = clean.split("\n")
@@ -298,9 +304,7 @@ class CascadeFlowEngine:
         platforms: list[dict[str, Any]],
         total_budget: float,
     ) -> float:
-        """
-        Compute unallocated budget as savings.
-        """
+        """Compute unallocated budget as savings."""
         allocated = sum(p.get("allocated_budget", 0.0) for p in platforms)
         return max(0.0, total_budget - allocated)
 
@@ -310,9 +314,7 @@ class CascadeFlowEngine:
 
     @staticmethod
     def _log(result: dict[str, Any], session_summary: Any) -> None:
-        """
-        Emit structured audit log for every execution.
-        """
+        """Emit structured audit log for every execution."""
         logger.info(
             "CASCADEFLOW RUNTIME: EXECUTION COMPLETE | "
             "run_id=%s | campaign=%s | complexity=%s | model=%s | "
